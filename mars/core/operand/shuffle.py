@@ -108,7 +108,12 @@ class MapReduceOperand(Operand):
                 if pop:
                     yield ctx.pop((key, self.reducer_index))
                 else:
-                    yield ctx[key, self.reducer_index]
+                    data = ctx[key, self.reducer_index]
+                    if isinstance(data, list):
+                        for d in data:
+                            yield d
+                    else:
+                        yield data
             except KeyError:
                 if not skip_none:  # pragma: no cover
                     raise

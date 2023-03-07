@@ -287,7 +287,7 @@ def _get_fetch_chunks(chunk_graph):
 
 
 def _get_subtask_out_info(
-    subtask_chunk_graph: ChunkGraph, is_mapper: bool, n_reducers: int = None
+    subtask_chunk_graph: ChunkGraph, is_mapper: bool, n_mergers: int = None
 ):
     # output_keys might be duplicate in chunk graph, use dict to deduplicate.
     # output_keys order should be consistent with remote `execute_subtask`,
@@ -295,9 +295,9 @@ def _get_subtask_out_info(
     output_keys = {}
     shuffle_chunk = None
     if is_mapper:
-        assert n_reducers is not None
+        assert n_mergers is not None
         if len(subtask_chunk_graph.result_chunks) == 1:
-            return set(), n_reducers
+            return set(), n_mergers
         for chunk in subtask_chunk_graph.result_chunks:
             if not chunk.is_mapper:
                 output_keys[chunk.key] = 1
@@ -307,7 +307,7 @@ def _get_subtask_out_info(
             else:
                 assert shuffle_chunk is None, (shuffle_chunk, chunk)
                 shuffle_chunk = chunk
-        return output_keys.keys(), len(output_keys) + n_reducers
+        return output_keys.keys(), len(output_keys) + n_mergers
     for chunk in subtask_chunk_graph.result_chunks:
         if isinstance(
             chunk.op, VirtualOperand
@@ -662,7 +662,9 @@ class RayTaskExecutor(TaskExecutor):
         self._cur_stage_tile_progress = (
             self._tile_context.get_all_progress() - self._pre_all_stages_tile_progress
         )
-        shuffle_manager = ShuffleManager(subtask_graph)
+        shuffle_manager = ShuffleManager(
+            subtask_graph, self._config.get_shuffle_config()
+        )
         monitor_context.stage = _RayExecutionStage.SUBMITTING
         monitor_context.shuffle_manager = shuffle_manager
         logger.info(
@@ -690,11 +692,13 @@ class RayTaskExecutor(TaskExecutor):
             # Can't use `subtask_graph.count_successors(subtask) == 0` to check output meta, because a subtask
             # may have some outputs which are dependent by downstream, but other outputs are not. see
             # https://user-images.githubusercontent.com/12445254/168484663-a4caa3f4-0ccc-4cd7-bf20-092356815073.png
-            is_mapper, n_reducers = shuffle_manager.is_mapper(subtask), None
+            is_mapper = shuffle_manager.is_mapper(subtask)
+            n_mergers = None
             if is_mapper:
-                n_reducers = shuffle_manager.get_n_reducers(subtask)
+                n_mergers = shuffle_manager.get_n_reducers(subtask)
+                # n_mergers = shuffle_manager.get_n_mergers(subtask)
             output_keys, out_count = _get_subtask_out_info(
-                subtask_chunk_graph, is_mapper, n_reducers
+                subtask_chunk_graph, is_mapper, n_mergers
             )
             if is_mapper:
                 # shuffle meta won't be recorded in meta service.
@@ -703,40 +707,62 @@ class RayTaskExecutor(TaskExecutor):
                 output_count = out_count + bool(subtask.stage_n_outputs)
             assert output_count != 0
             subtask_max_retries = subtask_max_retries if subtask.retryable else 0
-            output_object_refs = self._ray_executor.options(
-                num_cpus=subtask_num_cpus,
-                num_returns=output_count,
-                max_retries=subtask_max_retries,
-                memory=subtask_memory,
-                scheduling_strategy="DEFAULT" if len(input_object_refs) else "SPREAD",
-            ).remote(
-                subtask.subtask_id,
-                serialize(subtask_chunk_graph, context={"serializer": "ray"}),
-                subtask.stage_n_outputs,
-                is_mapper,
-                *input_object_refs,
-            )
-            await asyncio.sleep(0)
-            if output_count == 1:
-                output_object_refs = [output_object_refs]
-            submitted_subtask_number.record(1, metrics_tags)
-            monitor_context.submitted_subtasks.add(subtask)
-            monitor_context.object_ref_to_subtask[output_object_refs[0]] = subtask
-            subtask.runtime = _RaySubtaskRuntime()
-            if subtask.stage_n_outputs:
-                meta_object_ref, *output_object_refs = output_object_refs
-                # TODO(fyrestone): Fetch(not get) meta object here.
-                output_meta_object_refs.append(meta_object_ref)
             if is_mapper:
-                shuffle_manager.add_mapper_output_refs(
-                    subtask, output_object_refs[-n_reducers:]
+                ray_options = self._ray_executor.options(
+                    num_cpus=subtask_num_cpus,
+                    num_returns=output_count,
+                    max_retries=subtask_max_retries,
+                    memory=subtask_memory,
+                    scheduling_strategy="DEFAULT"
+                    if len(input_object_refs)
+                    else "SPREAD",
                 )
-                output_object_refs = output_object_refs[:-n_reducers]
-            # Mars chunk keys may be duplicate, so we should track the ref count.
-            for chunk_key, object_ref in zip(output_keys, output_object_refs):
-                if chunk_key in task_context:
-                    monitor_context.chunk_key_ref_count[chunk_key] += 1
-                task_context[chunk_key] = object_ref
+                ray_args = (
+                    subtask.subtask_id,
+                    serialize(subtask_chunk_graph, context={"serializer": "ray"}),
+                    subtask.stage_n_outputs,
+                    is_mapper,
+                    *input_object_refs,
+                )
+                shuffle_manager.add_map_subtask(subtask, ray_options, ray_args)
+                await asyncio.sleep(0)
+            else:
+                output_object_refs = self._ray_executor.options(
+                    num_cpus=subtask_num_cpus,
+                    num_returns=output_count,
+                    max_retries=subtask_max_retries,
+                    memory=subtask_memory,
+                    scheduling_strategy="DEFAULT"
+                    if len(input_object_refs)
+                    else "SPREAD",
+                ).remote(
+                    subtask.subtask_id,
+                    serialize(subtask_chunk_graph, context={"serializer": "ray"}),
+                    subtask.stage_n_outputs,
+                    is_mapper,
+                    *input_object_refs,
+                )
+                await asyncio.sleep(0)
+                if output_count == 1:
+                    output_object_refs = [output_object_refs]
+                submitted_subtask_number.record(1, metrics_tags)
+                monitor_context.submitted_subtasks.add(subtask)
+                monitor_context.object_ref_to_subtask[output_object_refs[0]] = subtask
+                subtask.runtime = _RaySubtaskRuntime()
+                if subtask.stage_n_outputs:
+                    meta_object_ref, *output_object_refs = output_object_refs
+                    # TODO(fyrestone): Fetch(not get) meta object here.
+                    output_meta_object_refs.append(meta_object_ref)
+                if is_mapper:
+                    shuffle_manager.add_mapper_output_refs(
+                        subtask, output_object_refs[-n_mergers:]
+                    )
+                    output_object_refs = output_object_refs[:-n_mergers]
+                # Mars chunk keys may be duplicate, so we should track the ref count.
+                for chunk_key, object_ref in zip(output_keys, output_object_refs):
+                    if chunk_key in task_context:
+                        monitor_context.chunk_key_ref_count[chunk_key] += 1
+                    task_context[chunk_key] = object_ref
         logger.info("Submitted %s subtasks of stage %s.", len(subtask_graph), stage_id)
 
         monitor_context.stage = _RayExecutionStage.WAITING

@@ -98,3 +98,6 @@ class RayExecutionConfig(ExecutionConfig):
         method = self._ray_execution_config.get("gc_method", "submitted")
         assert method in ["submitted", "completed"]
         return method
+
+    def get_shuffle_config(self):
+        return self._ray_execution_config.get("shuffle", {})
