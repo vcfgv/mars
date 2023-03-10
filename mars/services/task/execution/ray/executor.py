@@ -708,6 +708,7 @@ class RayTaskExecutor(TaskExecutor):
             assert output_count != 0
             subtask_max_retries = subtask_max_retries if subtask.retryable else 0
             if is_mapper:
+                assert subtask.stage_n_outputs == 0
                 ray_options = self._ray_executor.options(
                     num_cpus=subtask_num_cpus,
                     num_returns=output_count,
@@ -724,8 +725,9 @@ class RayTaskExecutor(TaskExecutor):
                     is_mapper,
                     *input_object_refs,
                 )
-                shuffle_manager.add_map_subtask(subtask, ray_options, ray_args)
-                await asyncio.sleep(0)
+                await shuffle_manager.add_map_subtask(
+                    subtask, ray_options, ray_args, monitor_context
+                )
             else:
                 output_object_refs = self._ray_executor.options(
                     num_cpus=subtask_num_cpus,
@@ -753,11 +755,6 @@ class RayTaskExecutor(TaskExecutor):
                     meta_object_ref, *output_object_refs = output_object_refs
                     # TODO(fyrestone): Fetch(not get) meta object here.
                     output_meta_object_refs.append(meta_object_ref)
-                if is_mapper:
-                    shuffle_manager.add_mapper_output_refs(
-                        subtask, output_object_refs[-n_mergers:]
-                    )
-                    output_object_refs = output_object_refs[:-n_mergers]
                 # Mars chunk keys may be duplicate, so we should track the ref count.
                 for chunk_key, object_ref in zip(output_keys, output_object_refs):
                     if chunk_key in task_context:
