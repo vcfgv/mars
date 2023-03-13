@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from typing import List, Iterable
+import math
 import asyncio
 import functools
 import logging
@@ -24,6 +25,7 @@ from .....utils import lazy_import
 from ....subtask import Subtask, SubtaskGraph
 
 ray = lazy_import("ray")
+scheduling_strategies = lazy_import("ray.util.scheduling_strategies")
 logger = logging.getLogger(__name__)
 
 
@@ -32,7 +34,7 @@ class ShuffleManager:
     mapper and reducer index.
     """
 
-    def __init__(self, subtask_graph: SubtaskGraph, config):
+    def __init__(self, subtask_graph: SubtaskGraph, config, n_cpus):
         self._subtask_graph = subtask_graph
         self._proxy_subtasks = subtask_graph.get_shuffle_proxy_subtasks()
         self._num_shuffles = subtask_graph.num_shuffles()
@@ -47,10 +49,11 @@ class ShuffleManager:
         # cleared after one round
         self._submitted_map_subtask_indices = []
         self._map_subtasks = []
+        self._num_workers_per_node_map = _get_num_workers_per_node_map(n_cpus)
         self._max_concurrent_rounds = max(config.get("max_concurrent_rounds") or 2, 1)
         self._wait_timeout = max(config.get("wait_timeout") or 1, 1)
+        self._merge_task_options = []
 
-        self._compute_shuffle_plan(config)
         # TODO: destroy()
         self._ray_merge_executor = self._get_ray_merge_executor()
 
@@ -64,8 +67,9 @@ class ShuffleManager:
             n_mappers = len(mapper_subtasks)
             n_reducers = proxy_subtask.chunk_graph.results[0].op.n_reducers
             n_mergers = n_reducers
-            n_rounds = min(self._merging_factor, n_mappers)
 
+            n_rounds = self._compute_shuffle_plan(config, n_mappers, n_reducers)
+            logger.info("Shuffle[%s] with num_rounds %s", shuffle_index, n_rounds)
             even_parts = [n_mappers // n_rounds for _ in range(n_rounds)]
             for i in range(n_mappers % n_rounds):
                 even_parts[i] += 1
@@ -113,13 +117,18 @@ class ShuffleManager:
         # Export remote function once.
         return ray.remote(execute_merge_task)
 
-    async def add_map_subtask(self, subtask, ray_options, ray_args, monitor_context):
-        self._map_subtasks.append((subtask, ray_options, ray_args))
+    async def add_map_subtask(
+        self,
+        subtask_infos,
+        monitor_context,
+        task_context,
+    ):
+        self._map_subtasks.append(subtask_infos)
         num_map_tasks_current_round = self._roundwise_num_map_tasks[
             self._current_shuffle
         ][self._current_round]
         if len(self._map_subtasks) == num_map_tasks_current_round:
-            self._submit_curr_map_subtasks(monitor_context)
+            self._submit_curr_map_subtasks(monitor_context, task_context)
             await asyncio.sleep(0)
             self._submit_merger_tasks()
             await asyncio.sleep(0)
@@ -132,11 +141,12 @@ class ShuffleManager:
                 )
                 self._current_round = 0
                 self._current_shuffle += 1
+                self._map_subtask_submit_history.clear()
 
-    def _submit_curr_map_subtasks(self, monitor_context):
+    def _submit_curr_map_subtasks(self, monitor_context, task_context):
         from .executor import _RaySubtaskRuntime
 
-        for subtask, options, args in self._map_subtasks:
+        for subtask, options, args, output_keys in self._map_subtasks:
             n_mergers = self.get_n_reducers(subtask)
             output_object_refs = options.remote(*args)
             if not isinstance(output_object_refs, list):
@@ -147,6 +157,11 @@ class ShuffleManager:
             monitor_context.submitted_subtasks.add(subtask)
             monitor_context.object_ref_to_subtask[output_object_refs[0]] = subtask
             subtask.runtime = _RaySubtaskRuntime()
+            for chunk_key, object_ref in zip(output_keys, output_object_refs):
+                if chunk_key in task_context:
+                    monitor_context.chunk_key_ref_count[chunk_key] += 1
+                task_context[chunk_key] = object_ref
+
         logger.info(
             "[R%s S%s] Submitted %s map subtasks: %s",
             self._current_round,
@@ -178,6 +193,7 @@ class ShuffleManager:
         for merger_index, input_refs in enumerate(self._get_merger_input_refs()):
             output_object_ref = self._ray_merge_executor.options(
                 num_returns=1,
+                **self._merge_task_options[self._current_shuffle][merger_index],
             ).remote(merger_index, *input_refs)
             self._merger_output_refs[self._current_shuffle][self._current_round][
                 merger_index
@@ -278,6 +294,16 @@ class ShuffleManager:
         """
         return subtask in self._mapper_indices
 
+    def is_reducer(self, subtask: Subtask):
+        return subtask in self._reducer_indices
+
+    def get_reducer_scheduling_strategy(self, subtask):
+        _, reducer_ordinal = self._reducer_indices[subtask]
+        merger_index = reducer_ordinal
+        return self._merge_task_options[self._current_shuffle][merger_index][
+            "scheduling_strategy"
+        ]
+
     def info(self):
         """
         A list of (mapper count, reducer count).
@@ -301,22 +327,59 @@ class ShuffleManager:
             return
         raise ValueError(f"The {subtask} should be a mapper or a reducer.")
 
-    def _compute_shuffle_plan(self, config):
-        # TODO: Scheduler of rounds
-        self._num_cpus_per_node_map = _get_num_cpus_per_node_map()
+    def _compute_shuffle_plan(self, config, n_mappers, n_reducers):
+        num_workers_total = sum(self._num_workers_per_node_map.values())
+        num_merge_tasks_per_round = n_reducers
+        left_over_merge_tasks = num_merge_tasks_per_round
+        logger.info("num_workers_total: %s", num_workers_total)
 
-        self._merging_factor = config.get("merging_factor") or 2
+        num_nodes = len(self._num_workers_per_node_map)
+        merge_task_placement = []
+        while left_over_merge_tasks > 0:
+            for node_id, num_workers in self._num_workers_per_node_map.items():
+                node_parallelism = (
+                    min(num_workers, num_merge_tasks_per_round // num_nodes)
+                    if num_merge_tasks_per_round >= num_nodes
+                    else 1
+                )
+                num_merge_tasks = min(node_parallelism, left_over_merge_tasks)
+                for _ in range(num_merge_tasks):
+                    merge_task_placement.append(node_id)
+                left_over_merge_tasks -= num_merge_tasks
+                if left_over_merge_tasks == 0:
+                    break
+
+        assert num_merge_tasks_per_round == len(merge_task_placement)
+        node_strategies = {
+            node_id: {
+                "scheduling_strategy": scheduling_strategies.NodeAffinitySchedulingStrategy(
+                    node_id, soft=True
+                )
+            }
+            for node_id in set(merge_task_placement)
+        }
+        self._merge_task_options.append(
+            [node_strategies[node_id] for node_id in merge_task_placement]
+        )
+        merging_factor = config.get("merging_factor") or 2
+        num_map_tasks_per_round = min(
+            max(num_workers_total - num_merge_tasks_per_round, merging_factor),
+            n_mappers,
+        )
+        logger.info("num_map_tasks_per_round: %s", num_map_tasks_per_round)
+        return math.ceil(n_mappers / num_map_tasks_per_round)
 
 
-def _get_num_cpus_per_node_map():
+def _get_num_workers_per_node_map(n_cpus):
     nodes = ray.nodes()
-    num_cpus_per_node_map = {}
+    num_workers_per_node_map = {}
     for node in nodes:
         num_cpus = int(node["Resources"].get("CPU", 0))
         if num_cpus == 0:
             continue
-        num_cpus_per_node_map[node["NodeID"]] = num_cpus
-    return num_cpus_per_node_map
+        num_workers_per_node_map[node["NodeID"]] = num_cpus // n_cpus
+    logger.info("num_workers_per_node_map: %s", num_workers_per_node_map)
+    return num_workers_per_node_map
 
 
 def _get_reducer_operand(subtask_chunk_graph):

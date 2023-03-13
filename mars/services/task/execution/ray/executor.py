@@ -663,7 +663,9 @@ class RayTaskExecutor(TaskExecutor):
             self._tile_context.get_all_progress() - self._pre_all_stages_tile_progress
         )
         shuffle_manager = ShuffleManager(
-            subtask_graph, self._config.get_shuffle_config()
+            subtask_graph,
+            config=self._config.get_shuffle_config(),
+            n_cpus=self._config.get_n_cpu(),
         )
         monitor_context.stage = _RayExecutionStage.SUBMITTING
         monitor_context.shuffle_manager = shuffle_manager
@@ -693,6 +695,7 @@ class RayTaskExecutor(TaskExecutor):
             # may have some outputs which are dependent by downstream, but other outputs are not. see
             # https://user-images.githubusercontent.com/12445254/168484663-a4caa3f4-0ccc-4cd7-bf20-092356815073.png
             is_mapper = shuffle_manager.is_mapper(subtask)
+            is_reducer = shuffle_manager.is_mapper(subtask)
             n_mergers = None
             if is_mapper:
                 n_mergers = shuffle_manager.get_n_reducers(subtask)
@@ -726,17 +729,22 @@ class RayTaskExecutor(TaskExecutor):
                     *input_object_refs,
                 )
                 await shuffle_manager.add_map_subtask(
-                    subtask, ray_options, ray_args, monitor_context
+                    (subtask, ray_options, ray_args, output_keys),
+                    monitor_context,
+                    task_context,
                 )
             else:
+                scheduling_strategy = "DEFAULT" if len(input_object_refs) else "SPREAD"
+                if is_reducer:
+                    scheduling_strategy = (
+                        shuffle_manager.get_reducer_scheduling_strategy(subtask)
+                    )
                 output_object_refs = self._ray_executor.options(
                     num_cpus=subtask_num_cpus,
                     num_returns=output_count,
                     max_retries=subtask_max_retries,
                     memory=subtask_memory,
-                    scheduling_strategy="DEFAULT"
-                    if len(input_object_refs)
-                    else "SPREAD",
+                    scheduling_strategy=scheduling_strategy,
                 ).remote(
                     subtask.subtask_id,
                     serialize(subtask_chunk_graph, context={"serializer": "ray"}),
