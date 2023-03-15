@@ -50,7 +50,7 @@ class ShuffleManager:
         self._submitted_map_subtask_indices = []
         self._map_subtasks = []
         self._num_workers_per_node_map = _get_num_workers_per_node_map(n_cpus)
-        self._max_concurrent_rounds = max(config.get("max_concurrent_rounds") or 2, 1)
+        self._max_concurrent_rounds = max(config.get("max_concurrent_rounds") or 1, 1)
         self._wait_timeout = max(config.get("wait_timeout") or 1, 1)
         self._merge_task_options = []
 
@@ -163,9 +163,9 @@ class ShuffleManager:
                 task_context[chunk_key] = object_ref
 
         logger.info(
-            "[R%s S%s] Submitted %s map subtasks: %s",
-            self._current_round,
+            "[S%s R%s] Submitted %s map subtasks: %s",
             self._current_shuffle,
+            self._current_round,
             len(self._submitted_map_subtask_indices),
             self._submitted_map_subtask_indices,
         )
@@ -182,9 +182,9 @@ class ShuffleManager:
                     remaining, fetch_local=False, timeout=self._wait_timeout
                 )
             logger.info(
-                "[R%s S%s] Tasks of round %s finished.",
-                self._current_round,
+                "[S%s R%s] Tasks of round %s finished.",
                 self._current_shuffle,
+                self._current_round,
                 prev_round,
             )
             for mapper_index in self._map_subtask_submit_history[prev_round]:
@@ -199,9 +199,9 @@ class ShuffleManager:
                 merger_index
             ] = output_object_ref
         logger.info(
-            "[R%s S%s] Submitted merger tasks.",
-            self._current_round,
+            "[S%s R%s] Submitted merger tasks.",
             self._current_shuffle,
+            self._current_round,
         )
         self._map_subtask_submit_history.append(self._submitted_map_subtask_indices[:])
         self._submitted_map_subtask_indices.clear()
@@ -298,9 +298,9 @@ class ShuffleManager:
         return subtask in self._reducer_indices
 
     def get_reducer_scheduling_strategy(self, subtask):
-        _, reducer_ordinal = self._reducer_indices[subtask]
+        shuffle_index, reducer_ordinal = self._reducer_indices[subtask]
         merger_index = reducer_ordinal
-        return self._merge_task_options[self._current_shuffle][merger_index][
+        return self._merge_task_options[shuffle_index][merger_index][
             "scheduling_strategy"
         ]
 
@@ -315,17 +315,29 @@ class ShuffleManager:
         Set the object refs to None by subtask.
         """
         index = self._mapper_indices.get(subtask)
+        should_raise_error = True
         if index is not None:
             shuffle_index, mapper_index = index
             self._mapper_output_refs[shuffle_index][mapper_index].fill(None)
-            return
+            # logger.info(
+            #     "remove_object_refs shuffle_index %s mapper_index %s",
+            #     shuffle_index,
+            #     mapper_index,
+            # )
+            should_raise_error = False
         index = self._reducer_indices.get(subtask)
         if index is not None:
             shuffle_index, reducer_ordinal = index
             self._mapper_output_refs[shuffle_index][:, reducer_ordinal].fill(None)
             self._merger_output_refs[shuffle_index][:, reducer_ordinal].fill(None)
-            return
-        raise ValueError(f"The {subtask} should be a mapper or a reducer.")
+            # logger.info(
+            #     "remove_object_refs shuffle_index %s reducer_ordinal %s",
+            #     shuffle_index,
+            #     reducer_ordinal,
+            # )
+            should_raise_error = False
+        if should_raise_error:
+            raise ValueError(f"The {subtask} should be a mapper or a reducer.")
 
     def _compute_shuffle_plan(self, config, n_mappers, n_reducers):
         num_workers_total = sum(self._num_workers_per_node_map.values())
