@@ -189,6 +189,7 @@ from .arithmetic import (
     fmin,
     isfinite,
     isinf,
+    isneginf,
     isnan,
     signbit,
     copysign,

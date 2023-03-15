@@ -857,6 +857,7 @@ def test_ufunc(setup):
         [np.isnan, mt.isnan],
         [np.isfinite, mt.isfinite],
         [np.isinf, mt.isinf],
+        [np.isneginf, mt.isneginf],
         [np.negative, mt.negative],
     ]
 

@@ -92,6 +92,7 @@ from .fmax import fmax, TensorFMax
 from .fmin import fmin, TensorFMin
 from .isfinite import isfinite, TensorIsFinite
 from .isinf import isinf, TensorIsInf
+from .isneginf import isneginf, TensorIsNegInf
 from .isnan import isnan, TensorIsNan
 from .signbit import signbit, TensorSignbit
 from .copysign import copysign, TensorCopysign
