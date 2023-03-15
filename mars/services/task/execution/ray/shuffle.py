@@ -191,9 +191,12 @@ class ShuffleManager:
                 self._mapper_output_refs[self._current_shuffle][mapper_index].fill(None)
 
         for merger_index, input_refs in enumerate(self._get_merger_input_refs()):
+            scheduling_strategy = scheduling_strategies.NodeAffinitySchedulingStrategy(
+                self._merge_task_options[self._current_shuffle][merger_index], soft=True
+            )
             output_object_ref = self._ray_merge_executor.options(
                 num_returns=1,
-                **self._merge_task_options[self._current_shuffle][merger_index],
+                scheduling_strategy=scheduling_strategy,
             ).remote(merger_index, *input_refs)
             self._merger_output_refs[self._current_shuffle][self._current_round][
                 merger_index
@@ -300,9 +303,9 @@ class ShuffleManager:
     def get_reducer_scheduling_strategy(self, subtask):
         shuffle_index, reducer_ordinal = self._reducer_indices[subtask]
         merger_index = reducer_ordinal
-        return self._merge_task_options[shuffle_index][merger_index][
-            "scheduling_strategy"
-        ]
+        return scheduling_strategies.NodeAffinitySchedulingStrategy(
+            self._merge_task_options[shuffle_index][merger_index], soft=True
+        )
 
     def info(self):
         """
@@ -362,17 +365,7 @@ class ShuffleManager:
                     break
 
         assert num_merge_tasks_per_round == len(merge_task_placement)
-        node_strategies = {
-            node_id: {
-                "scheduling_strategy": scheduling_strategies.NodeAffinitySchedulingStrategy(
-                    node_id, soft=True
-                )
-            }
-            for node_id in set(merge_task_placement)
-        }
-        self._merge_task_options.append(
-            [node_strategies[node_id] for node_id in merge_task_placement]
-        )
+        self._merge_task_options.append(merge_task_placement)
         merging_factor = config.get("merging_factor") or 2
         num_map_tasks_per_round = min(
             max(num_workers_total - num_merge_tasks_per_round, merging_factor),
