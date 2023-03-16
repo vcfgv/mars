@@ -993,6 +993,7 @@ class RayTaskExecutor(TaskExecutor):
                         for p in ppreds:
                             logger.debug("GC[stage=%s] shuffle: %s", stage_id, p)
                             monitor_context.shuffle_manager.remove_object_refs(p)
+                        monitor_context.shuffle_manager.remove_object_refs(subtask)
                     else:
                         gc_subtasks.add(pred)
                         gc_chunks = pred.chunk_graph.results
