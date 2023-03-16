@@ -503,6 +503,33 @@ class GraphAnalyzer:
                             mapper_color = coloring.next_color()
                             chunk_to_colors[mapper] = mapper_color
                             color_to_chunks[mapper_color] = [mapper]
+                reducer_chunks = self._chunk_graph.successors(chunk)
+                for reducer_chunk in reducer_chunks:
+                    chunk_color = chunk_to_colors[reducer_chunk]
+                    same_color_chunks = color_to_chunks[chunk_color]
+                    reducers = [
+                        c
+                        for c in same_color_chunks
+                        if c.op.stage == OperandStage.reduce
+                        and any(
+                            isinstance(pred.op, ShuffleProxy)
+                            for pred in self._chunk_graph.iter_predecessors(c)
+                        )
+                        and len(
+                            set(
+                                type(same_color_chunk.op)
+                                for same_color_chunk in same_color_chunks
+                            )
+                        )
+                        > 1
+                    ]
+                    if len(reducers) > 0:
+                        # ensure every subtask contains only at most one reducer
+                        for reducer in reducers:
+                            same_color_chunks.remove(reducer)
+                            reducer_color = coloring.next_color()
+                            chunk_to_colors[reducer] = reducer_color
+                            color_to_chunks[reducer_color] = [reducer]
 
         # build color dag
         color_set = set(chunk_to_colors.values())
