@@ -427,7 +427,7 @@ class TaskProcessor:
         if directory is None:
             directory = tempfile.gettempdir()
         os.makedirs(directory, exist_ok=True)
-        file_name = f"mars-{self.task_id}"
+        file_name = f"mars-{self.task_id}.dot"
         logger.info(
             "Subtask graph of task %s is stored in %s",
             self._task.task_id,

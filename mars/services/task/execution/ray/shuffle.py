@@ -376,6 +376,10 @@ class ShuffleManager:
 
 
 def _get_num_workers_per_node_map(n_cpus):
+    if not ray.is_initialized():
+        logger.warning("Ray is not started, start the local ray cluster by `ray.init`.")
+        # add 16 logical cpus for other computing in ray.
+        ray.init()
     nodes = ray.nodes()
     num_workers_per_node_map = {}
     for node in nodes:
@@ -397,14 +401,14 @@ def _get_reducer_operand(subtask_chunk_graph):
 
 def execute_merge_task(merge_index, *inputs):
     # Vanilla
-    sample = inputs[0]
-    if isinstance(sample, (pd.DataFrame, pd.Series)):
-        output = pd.concat(inputs)
-    elif isinstance(sample, np.ndarray):
-        output = np.concatenate(inputs)
-    else:
-        # Tuple[Tuple(chunk index), pandas.DataFrame]
-        # Tuple[mapper_id, Tuple(chunk index), pd.DataFrame]
-        output = list(inputs)
+    # sample = inputs[0]
+    # if isinstance(sample, (pd.DataFrame, pd.Series)):
+    #     output = pd.concat(inputs)
+    # elif isinstance(sample, np.ndarray):
+    #     output = np.concatenate(inputs)
+    # else:
+    #     # Tuple[Tuple(chunk index), pandas.DataFrame]
+    #     # Tuple[mapper_id, Tuple(chunk index), pd.DataFrame]
+    #     output = list(inputs)
 
-    return output
+    return list(inputs)
